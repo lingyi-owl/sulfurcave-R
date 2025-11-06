@@ -53,123 +53,38 @@ flows <- virus_abundance_df_long %>%
     flow = abundance * wt
   )
 
-test_flows <- virus_abundance_df_long %>%
-  left_join(hosts_weight, by = "contig_id") %>%
+# 4) Replace NA with 'Unclassified' and collapse the taxa with <1% abundance
+flows_collapsed <- flows %>%
+  # replace NA with 'Unclassified'
   mutate(
-    wt = ifelse(is.na(wt), 1, wt),       # assign full weight to contigs without hosts
-    flow = abundance * wt
+    vcat_class  = if_else(is.na(vcat_class),  "Unclassified", vcat_class),
+    iphop_genus = if_else(is.na(iphop_genus), "Unclassified", iphop_genus)
+  ) %>%
+  # compute total abundance across all samples
+  mutate(total_abundance = sum(abundance, na.rm = TRUE)) %>%
+  group_by(vcat_class) %>%
+  mutate(vcat_total = sum(abundance, na.rm = TRUE)) %>%
+  ungroup() %>%
+  group_by(iphop_genus) %>%
+  mutate(host_total = sum(abundance, na.rm = TRUE)) %>%
+  ungroup() %>%
+  mutate(
+    vcat_class = if_else(vcat_total / total_abundance < 0.01, "Below 1%", vcat_class),
+    iphop_genus = if_else(host_total / total_abundance < 0.01, "Below 1%", iphop_genus)
   )
 
-summary_df <- flows %>%
+# examine the results
+summary_df <- flows_collapsed %>%
   group_by(sample) %>%
   summarise(
     total_abundance = sum(abundance, na.rm = TRUE),
     total_flow = sum(flow, na.rm = TRUE),
     .groups = "drop"
   )
-# 4) Build lodes per sample (Virus → Host), keeping contig_id as alluvium
-make_lodes <- function(df_one_sample) {
-  df_one_sample %>%
-    transmute(contig_id, Virus = vcat_class, Host = iphop_genus, weight = flow) %>%
-    ggalluvial::to_lodes_form(
-      axes  = c("Virus", "Host"),
-      key   = "axis",
-      value = "stratum",
-      id    = "contig_id"
-    )
-}
 
-lodes_by_sample <- flows %>%
-  group_split(sample, .keep = TRUE) %>%
-  setNames(unique(flows$sample)) %>%
-  map(make_lodes)
-
-# 5) A plotting helper to keep styling consistent across samples
-plot_alluvial <- function(lodes_df, sample_name) {
-  ggplot(lodes_df,
-         aes(x = axis,
-             stratum = stratum,
-             alluvium = contig_id,
-             y = weight,
-             fill = stratum)) +
-    geom_alluvium(alpha = 0.6, knot.pos = 0.4) +
-    geom_stratum(width = 0.3, color = "#decbe4") +
-    scale_x_discrete(limits = c("Virus","Host"), expand = c(.12, .12)) +
-    labs(
-      title = paste("Taxonomy → Host alluvial"),
-      subtitle = paste("Sample:", sample_name),
-      x = NULL, y = "Relative abundance (allocated)"
-    ) +
-    theme_minimal(base_size = 12) +
-    theme(legend.position = "none")
-}
-
-plots <- imap(lodes_by_sample, plot_alluvial)
-plots
-
-
-
-# starting from `flows` (with columns: contig_id, virus, host, sample, flow)
-
-lodes_all <- flows %>%
-  transmute(contig_id, Virus = vcat_class, Host = iphop_genus, weight = flow, sample) %>%
-  ggalluvial::to_lodes_form(
-    axes  = c("Virus", "Host"),
-    key   = "axis",
-    value = "stratum",
-    id    = "contig_id"
-  )
-
-ggplot(lodes_all,
-       aes(x = axis,
-           stratum = stratum,
-           alluvium = contig_id,
-           y = weight,
-           fill = stratum)) +
-  geom_alluvium(alpha = 0.6, knot.pos = 0.4) +
-  geom_stratum(width = 0.3, color = "#decbe4") +
-  scale_x_discrete(limits = c("Virus","Host"), expand = c(.12, .12)) +
-  facet_wrap(~ sample, nrow = 1) +
-  theme_minimal(base_size = 12) 
-
-#####################################################################
-# 3) Compute mean share across samples for each vcat_class and host_genus
-#    Work with within-sample percentages so it's robust even if per-sample totals ≠ 1
-flows_pct <- flows %>%
-  group_by(sample) %>%
-  mutate(sample_total = sum(flow),
-         flow_pct = ifelse(sample_total > 0, flow / sample_total, 0)) %>%
-  ungroup()
-
-taxon_avg <- flows_pct %>%
-  group_by(vcat_class, sample) %>%
-  summarise(pct = sum(flow_pct), .groups = "drop") %>%
-  group_by(vcat_class) %>%
-  summarise(avg_pct = mean(pct), .groups = "drop")
-
-host_avg <- flows_pct %>%
-  group_by(host_genus, sample) %>%
-  summarise(pct = sum(flow_pct), .groups = "drop") %>%
-  group_by(host_genus) %>%
-  summarise(avg_pct = mean(pct), .groups = "drop")
-
-rare_taxa  <- taxon_avg  %>% filter(avg_pct < 0.01) %>% pull(vcat_class)
-rare_hosts <- host_avg   %>% filter(avg_pct < 0.01) %>% pull(host_genus)
-
-## 4) Collapse rare categories to "Below 1%"
-flows_collapsed <- flows %>%
-  mutate(
-    vcat_class2 = fct_other(vcat_class,
-                            keep = setdiff(unique(vcat_class), rare_taxa),
-                            other_level = "Below 1%"),
-    host_genus2 = fct_other(host_genus,
-                            keep = setdiff(unique(host_genus), rare_hosts),
-                            other_level = "Below 1%")
-  )
-
-## 5) Build lodes and facet by sample (three panels side by side) with legend shown
+# 5) Build lodes and facet by sample (three panels side by side) with legend shown
 lodes_all <- flows_collapsed %>%
-  transmute(contig_id, Virus = vcat_class2, Host = host_genus2, weight = flow, sample) %>%
+  transmute(contig_id, Virus = vcat_class, Host = iphop_genus, weight = flow, sample) %>%
   ggalluvial::to_lodes_form(
     axes  = c("Virus", "Host"),
     key   = "axis",
@@ -196,15 +111,23 @@ my_colors <- c(
   "Faserviricetes" = "#2ca02c", 
   "Megaviricetes" = "#d62728",
   "Below 1%" = "#1f77b4", 
-  "Unclassified" = '#decbe4',
+  "Unclassified" = 'gray',
   
   # hosts
   "Acidithiobacillus" = "#fdc086",
-  "Ferroplasma" = "#ccebc5",
-  "Mycobacterium" = "#fbb4ae",
-  "Cuniculiplasma" = "#b3cde3",
   "Below 1%" = "#1f77b4",
-  "Unclassified" = '#decbe4'
+  "Cuniculiplasma" = "#b3cde3",
+  "Escherichia" = "#C49C94FF",
+  "Ferroplasma" = "#ccebc5",
+  "Igneacidithiobacillus" = "#decbe4",
+  "JAKAFX01" = "#9EDAE5FF",
+  "Lachnospira" = "#e5d8bd",
+  # "Marinobacter" = "#fddaec",
+  "Mobilitalea" = "#DBDB8DFF",
+  "Mycobacterium" = "#fbb4ae",
+  # "Streptomyces" = "#ffffcc",
+  # "Sulfobacillus" = "#98DF8AFF",
+  "Unclassified" = 'gray'
 )
 
 p <- ggplot(lodes_all,
@@ -219,16 +142,18 @@ p <- ggplot(lodes_all,
   scale_fill_manual(values = my_colors, name = "Virus / Host") +
   facet_wrap(~ sample, nrow = 1, labeller = labeller(sample = name_map)) +
   labs(
-    x = NULL,
+    x = "Viral Taxonomy --> Microbial Host Prediction",
     y = "Relative abundance (%)",
-    title = "Virus and predicted host abundance",
+    title = "Virus and predicted microbial host abundance",
     # subtitle = "Categories with average abundance < 1% across samples are grouped as 'Below 1%'",
     fill = "Taxa / Hosts"
   ) +
-  theme_minimal(base_size = 20)
-  # theme(legend.position = "none")
+  theme_minimal(base_size = 20) +
+  theme(legend.position = "none")
 
 p <- p + theme(
+  axis.text.x = element_blank(),   # 👈 removes “Virus” and “Host” text on x-axis
+  axis.ticks.x = element_blank(),   # 👈 removes x-axis ticks as well
   text = element_text(size = 20, colour = "black"),   # all text black, uniform size
   plot.title = element_text(size = 20, colour = "black"),
   axis.title = element_text(size = 20, colour = "black"),
@@ -237,9 +162,3 @@ p <- p + theme(
 )
 
 p
-
-########################################################################
-# summary
-iphop_genome_df %>%
-  filter(!is.na(host_genus) & host_genus != "") %>%
-  summarise(unique_virus_with_hosts = n_distinct(Virus))

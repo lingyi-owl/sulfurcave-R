@@ -1,85 +1,76 @@
 library(dplyr)
-library(stringr)
+# library(stringr)
 library(tidyr)
 library(ggplot2)
 library(ggalluvial)
 library(purrr)
-library(forcats)
+# library(forcats)
 
-# test
-# vcat_df <- read.csv2('/Users/wu000058/Library/Mobile Documents/com~apple~CloudDocs/Projects/SulfurCave/vcat/UPDATED_filtered_virus_contigs_cb1_60_cb2_300_C_10_length_10kb_seq_fasta.tsv', sep = '\t')
-# vcat_df <- vcat_df %>%
-#   select(SequenceID,)
+# 1) Import data
+# import the virus character data (Note: the iphop data is old and not usable in the file)
 virus_character_df <- read.csv2('/Users/wu000058/Library/Mobile Documents/com~apple~CloudDocs/Projects/SulfurCave/virus_character/sulfur_cave_virus_character_abundance.txt', sep = '\t')
 
+# select the vcat virus taxonomy data
 virus_vcat_df <- virus_character_df %>%
   select(contig_id, vcat_class)
 
+# select the virus abundance data
 virus_abundance_df <- virus_character_df %>%
   select(contig_id, starts_with("Sample_"))
 
+# convert the abundance data frame from wide to long format
 virus_abundance_df_long <- virus_abundance_df %>% 
   pivot_longer(
     cols = `Sample_ERR10036468`:`Sample_ERR10036470`, 
     names_to = "sample",
     values_to = "abundance"
   )
-class(virus_abundance_df_long$abundance)
+
+# convert the abundance column from character to numeric
 virus_abundance_df_long$abundance <- as.numeric(virus_abundance_df_long$abundance)
+class(virus_abundance_df_long$abundance)
 
-iphop_genome_df <- read.csv2('/Users/wu000058/Library/Mobile Documents/com~apple~CloudDocs/Projects/SulfurCave/iphop/iphop_v1.4_w_MAGs/Host_prediction_to_genome_m90.csv', sep = ',')
-iphop_genome_df <- iphop_genome_df %>%
-  mutate(
-    Host.taxonomy = str_trim(Host.taxonomy),
-    # Prefer genus (even if empty), otherwise fall back to family, else NA
-    host_genus_lineage = case_when(
-      str_detect(Host.taxonomy, "g__") ~
-        str_replace(Host.taxonomy, "^(.*?g__[^;]*).*", "\\1"),
-      str_detect(Host.taxonomy, "f__") ~
-        str_replace(Host.taxonomy, "^(.*?f__[^;]*).*", "\\1"),
-      TRUE ~ NA_character_
-    ),
-    host_genus = case_when(
-      str_detect(Host.taxonomy, "g__") ~ 
-        str_replace(Host.taxonomy, ".*g__([^;]*).*", "\\1"),
-      TRUE ~ NA_character_
-    )
-  )
+# import the cleaned new iphop data frame without MAGs
+iphop_genome_df <- read.csv2('/Users/wu000058/Library/Mobile Documents/com~apple~CloudDocs/Projects/SulfurCave/iphop/iphop_v1.4_no_MAGs/sulfurcave_iphop_v1.4_no_MAGs_genome_output_distinct.txt', sep = '\t')
 
-iphop_genome_df2 <- iphop_genome_df %>%
-  select(Virus, host_genus)
+# find the virus with multiple predicted hosts
+multiple_hosts_virus <- iphop_genome_df$contig_id[duplicated(iphop_genome_df$contig_id)]
 
-iphop_genome_df_distinct <- iphop_genome_df2 %>%
-  distinct()
-
-colnames(iphop_genome_df_distinct) <- c('contig_id', 'host_genus')
-
-multiple_hosts_virus <- iphop_genome_df_distinct$contig_id[duplicated(iphop_genome_df_distinct$contig_id)]
-multiple_hosts_virus_df <- iphop_genome_df_distinct[iphop_genome_df_distinct$contig_id %in% multiple_hosts_virus,]
-
-host_df <- as.data.frame(virus_vcat_df$contig_id)
-colnames(host_df) <- 'contig_id'
-host_df <- left_join(host_df, iphop_genome_df_distinct, by = 'contig_id')
-host_df$score <- NA
-# 1) Normalize host weights per contig
-hosts_w <- host_df %>%
+# 2) Weight predicted hosts evenly by the number of predictions
+# distribute abundance evenly across all hosts per contig_id
+hosts_weight <- iphop_genome_df %>%
   group_by(contig_id) %>%
-  mutate(
-    wt = if (all(is.na(score))) 1/n() else score / sum(score, na.rm = TRUE)
-  ) %>%
+  mutate(wt = 1 / n()) %>%
   ungroup()
 
-# 2) Join abundance + taxonomy + host weights and allocate flow
-#    Each contig–host edge gets a share of the contig's abundance in each sample.
+# 3) Join abundance + taxonomy + host weights and allocate flow
+# each contig–host edge gets a share of the contig's abundance in each sample.
 flows <- virus_abundance_df_long %>%
-  inner_join(virus_vcat_df,  by = "contig_id") %>%
-  inner_join(hosts_w,  by = "contig_id") %>%
-  mutate(flow = abundance * wt)
+  left_join(virus_vcat_df,  by = "contig_id") %>%
+  left_join(hosts_weight,  by = "contig_id") %>%
+  mutate(
+    wt = ifelse(is.na(wt), 1, wt),       # assign full weight to contigs without hosts
+    flow = abundance * wt
+  )
 
-# 3) Build lodes per sample (Virus → Host), keeping contig_id as alluvium
+test_flows <- virus_abundance_df_long %>%
+  left_join(hosts_weight, by = "contig_id") %>%
+  mutate(
+    wt = ifelse(is.na(wt), 1, wt),       # assign full weight to contigs without hosts
+    flow = abundance * wt
+  )
+
+summary_df <- flows %>%
+  group_by(sample) %>%
+  summarise(
+    total_abundance = sum(abundance, na.rm = TRUE),
+    total_flow = sum(flow, na.rm = TRUE),
+    .groups = "drop"
+  )
+# 4) Build lodes per sample (Virus → Host), keeping contig_id as alluvium
 make_lodes <- function(df_one_sample) {
   df_one_sample %>%
-    transmute(contig_id, Virus = vcat_class, Host = host_genus, weight = flow) %>%
+    transmute(contig_id, Virus = vcat_class, Host = iphop_genus, weight = flow) %>%
     ggalluvial::to_lodes_form(
       axes  = c("Virus", "Host"),
       key   = "axis",
@@ -93,7 +84,7 @@ lodes_by_sample <- flows %>%
   setNames(unique(flows$sample)) %>%
   map(make_lodes)
 
-# 4) A plotting helper to keep styling consistent across samples
+# 5) A plotting helper to keep styling consistent across samples
 plot_alluvial <- function(lodes_df, sample_name) {
   ggplot(lodes_df,
          aes(x = axis,
@@ -121,7 +112,7 @@ plots
 # starting from `flows` (with columns: contig_id, virus, host, sample, flow)
 
 lodes_all <- flows %>%
-  transmute(contig_id, Virus = vcat_class, Host = host_genus, weight = flow, sample) %>%
+  transmute(contig_id, Virus = vcat_class, Host = iphop_genus, weight = flow, sample) %>%
   ggalluvial::to_lodes_form(
     axes  = c("Virus", "Host"),
     key   = "axis",
